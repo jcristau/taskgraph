@@ -2,8 +2,13 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+
+import pytest
+
 from taskgraph import generator, graph
-from taskgraph.generator import load_tasks_for_kind
+from taskgraph.generator import Kind, load_tasks_for_kind
+from taskgraph.loader.default import loader as default_loader
+from taskgraph.transforms import job, notify, task
 
 from .conftest import FakeKind, WithFakeKind, fake_load_graph_config
 
@@ -134,3 +139,58 @@ def test_load_tasks_for_kind(monkeypatch):
         "/root",
     )
     assert "t-1" in tasks and tasks["t-1"].label == "_example-kind-t-1"
+
+
+@pytest.mark.parametrize(
+    "config,expected_transforms",
+    (
+        pytest.param(
+            {},
+            [job.transforms, task.transforms],
+            id="no_transforms",
+        ),
+        pytest.param(
+            {"transforms": ["taskgraph.transforms.notify:transforms"]},
+            [notify.transforms, job.transforms, task.transforms],
+            id="additional_transform_specified",
+        ),
+    ),
+)
+def test_default_loader(config, expected_transforms):
+    loader, transforms = Kind("", "", config, {})._get_loader_and_transforms()
+    assert (
+        loader is default_loader
+    ), "Default Kind loader should be taskgraph.loader.transform.loader"
+
+    assert transforms._transforms == expected_transforms
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        pytest.param(
+            {
+                "transforms": [
+                    "taskgraph.transforms.job:transforms",
+                    "taskgraph.transforms.task:transforms",
+                ]
+            },
+            id="job_and_task_transforms_specified",
+        ),
+        pytest.param(
+            {"transforms": ["taskgraph.transforms.job:transforms"]},
+            id="only_job_transform_specified",
+        ),
+        pytest.param(
+            {"transforms": ["taskgraph.transforms.task:transforms"]},
+            id="only_task_transform_specified",
+        ),
+    ),
+)
+def test_default_loader_errors(config):
+    try:
+        loader, transforms = Kind("", "", config, {})._get_loader_and_transforms()
+    except KeyError:
+        return
+
+    assert False, "Should've raised a KeyError"

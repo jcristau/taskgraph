@@ -11,7 +11,7 @@ from taskgraph.optimize import OptimizationStrategy
 from taskgraph.optimize import base as optimize_mod
 from taskgraph.task import Task
 from taskgraph.taskgraph import TaskGraph
-from taskgraph.transforms.base import TransformConfig
+from taskgraph.transforms.base import TransformConfig, TransformSequence
 from taskgraph.util.templates import merge
 
 here = Path(__file__).parent
@@ -41,8 +41,10 @@ def fake_loader(kind, path, config, parameters, loaded_tasks):
 
 
 class FakeKind(Kind):
-    def _get_loader(self):
-        return fake_loader
+    loaded_kinds = []
+
+    def _get_loader_and_transforms(self):
+        return fake_loader, TransformSequence()
 
     def load_tasks(self, parameters, loaded_tasks, write_artifacts):
         FakeKind.loaded_kinds.append(self.name)
