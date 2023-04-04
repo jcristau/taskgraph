@@ -67,7 +67,7 @@ def inherit_treeherder_from_dep(job, dep_job):
 def treeherder_defaults(kind, label):
     defaults = {
         # Despite its name, this is expected to be a platform+collection
-        "platform": f"default/opt",
+        "platform": "default/opt",
         "tier": 1,
     }
     if "build" in kind:
