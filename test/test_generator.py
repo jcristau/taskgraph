@@ -157,10 +157,11 @@ def test_load_tasks_for_kind(monkeypatch):
     ),
 )
 def test_default_loader(config, expected_transforms):
-    loader, transforms = Kind("", "", config, {})._get_loader_and_transforms()
+    loader = Kind("", "", config, {})._get_loader()
     assert (
         loader is default_loader
     ), "Default Kind loader should be taskgraph.loader.transform.loader"
+    transforms, inputs = loader("", "", config, {}, [])
 
     assert transforms._transforms == expected_transforms
 
@@ -188,8 +189,9 @@ def test_default_loader(config, expected_transforms):
     ),
 )
 def test_default_loader_errors(config):
+    loader = Kind("", "", config, {})._get_loader()
     try:
-        loader, transforms = Kind("", "", config, {})._get_loader_and_transforms()
+        inputs = loader("", "", config, {}, [])
     except KeyError:
         return
 

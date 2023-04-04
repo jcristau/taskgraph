@@ -5,7 +5,9 @@
 
 import logging
 
+from ..util.python_path import find_object
 from .transform import loader as transform_loader
+from ..transforms.base import TransformSequence
 
 logger = logging.getLogger(__name__)
 
@@ -17,12 +19,20 @@ DEFAULT_TRANSFORMS = [
 ]
 
 
-def loader(*args, **kwargs):
+def loader(kind, path, config, params, loaded_tasks):
     """
     This default loader builds on the `transform` loader by providing sensible
     default transforms that the majority of simple tasks will need.
     Specifically, `job` and `task` transforms will be appended to the end of the
     list of transforms in the kind being loaded.
     """
-
-    yield from transform_loader(*args, **kwargs)
+    transform_refs = config.get("transforms", [])
+    for t in DEFAULT_TRANSFORMS:
+        if t in config.get("transforms", ()):
+            raise KeyError(f"Transform {t} is already added by the default transform; it must not be defined in the kind")
+    transform_refs.extend(DEFAULT_TRANSFORMS)
+    transforms = TransformSequence()
+    for xform_path in transform_refs:
+        transform = find_object(xform_path)
+        transforms.add(transform)
+    return transforms, transform_loader(kind, path, config, params, loaded_tasks)

@@ -39,34 +39,15 @@ class Kind:
     config = attr.ib(type=dict)
     graph_config = attr.ib(type=GraphConfig)
 
-    def _get_loader_and_transforms(self):
+    def _get_loader(self):
         try:
-            loader = find_object(self.config["loader"])
+            loader = self.config["loader"]
         except KeyError:
-            loader = find_object("taskgraph.loader.default:loader")
-
-        loader_module = import_module(loader.__module__)
-
-        transform_refs = copy.copy(self.config.get("transforms", []))
-        if hasattr(loader_module, "DEFAULT_TRANSFORMS"):
-            # To avoid confusion, we do not allow these transforms to be
-            # specified if they are going to be added automatically. This
-            # avoids issues such as including them twice, being in a different
-            # order in the kind vs. here, etc.
-            for t in loader_module.DEFAULT_TRANSFORMS:
-                if t in transform_refs:
-                    raise KeyError(
-                        f"Transform {t} is already defined in {loader.__module__}.DEFAULT_TRANSFORMS; it must not be defined in the kind"
-                    )
-            transform_refs.extend(loader_module.DEFAULT_TRANSFORMS)
-        transforms = TransformSequence()
-        for xform_path in transform_refs:
-            transform = find_object(xform_path)
-            transforms.add(transform)
-        return loader, transforms
+            loader = "taskgraph.loader.default:loader"
+        return find_object(loader)
 
     def load_tasks(self, parameters, loaded_tasks, write_artifacts):
-        loader, transforms = self._get_loader_and_transforms()
+        loader = self._get_loader()
         config = copy.deepcopy(self.config)
 
         kind_dependencies = config.get("kind-dependencies", [])
@@ -75,6 +56,13 @@ class Kind:
         }
 
         inputs = loader(self.name, self.path, config, parameters, loaded_tasks)
+        if isinstance(inputs, tuple):
+            transforms, inputs = inputs
+        else:
+            transforms = TransformSequence()
+            for xform_path in config["transforms"]:
+                transform = find_object(xform_path)
+                transforms.add(transform)
 
         # perform the transformations on the loaded inputs
         trans_config = TransformConfig(
