@@ -146,23 +146,24 @@ def test_load_tasks_for_kind(monkeypatch):
     (
         pytest.param(
             {},
-            [job.transforms, task.transforms],
+            ["taskgraph.transforms.job:transforms", "taskgraph.transforms.task:transforms"],
             id="no_transforms",
         ),
         pytest.param(
             {"transforms": ["taskgraph.transforms.notify:transforms"]},
-            [notify.transforms, job.transforms, task.transforms],
+            ["taskgraph.transforms.notify:transforms", "taskgraph.transforms.job:transforms", "taskgraph.transforms.task:transforms"],
             id="additional_transform_specified",
         ),
     ),
 )
 def test_default_loader(config, expected_transforms):
-    loader, transforms = Kind("", "", config, {})._get_loader_and_transforms()
+    loader = Kind("", "", config, {})._get_loader()
     assert (
         loader is default_loader
     ), "Default Kind loader should be taskgraph.loader.transform.loader"
+    inputs = loader("", "", config, {}, [])
 
-    assert transforms._transforms == expected_transforms
+    assert config["transforms"] == expected_transforms
 
 
 @pytest.mark.parametrize(
@@ -188,8 +189,9 @@ def test_default_loader(config, expected_transforms):
     ),
 )
 def test_default_loader_errors(config):
+    loader = Kind("", "", config, {})._get_loader()
     try:
-        loader, transforms = Kind("", "", config, {})._get_loader_and_transforms()
+        inputs = loader("", "", config, {}, [])
     except KeyError:
         return
 

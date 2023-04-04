@@ -17,12 +17,16 @@ DEFAULT_TRANSFORMS = [
 ]
 
 
-def loader(*args, **kwargs):
+def loader(kind, path, config, params, loaded_tasks):
     """
     This default loader builds on the `transform` loader by providing sensible
     default transforms that the majority of simple tasks will need.
     Specifically, `job` and `task` transforms will be appended to the end of the
     list of transforms in the kind being loaded.
     """
-
-    yield from transform_loader(*args, **kwargs)
+    transform_refs = config.setdefault("transforms", [])
+    for t in DEFAULT_TRANSFORMS:
+        if t in config.get("transforms", ()):
+            raise KeyError(f"Transform {t} is already added by the default transform; it must not be defined in the kind")
+    transform_refs.extend(DEFAULT_TRANSFORMS)
+    return transform_loader(kind, path, config, params, loaded_tasks)

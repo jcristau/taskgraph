@@ -43,8 +43,8 @@ def fake_loader(kind, path, config, parameters, loaded_tasks):
 class FakeKind(Kind):
     loaded_kinds = []
 
-    def _get_loader_and_transforms(self):
-        return fake_loader, TransformSequence()
+    def _get_loader(self):
+        return fake_loader
 
     def load_tasks(self, parameters, loaded_tasks, write_artifacts):
         FakeKind.loaded_kinds.append(self.name)
