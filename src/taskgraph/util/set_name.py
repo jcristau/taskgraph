@@ -22,7 +22,7 @@ def set_name(name, schema=None):
 
 
 @set_name("strip-kind")
-def set_name_strip_kind(config, tasks, primary_dep, primary_kind):
+def set_name_strip_kind(config, tasks, primary_dep, primary_kind, name):
     if primary_dep.label.startswith(primary_kind):
         return primary_dep.label[len(primary_kind) + 1 :]
     else:
@@ -30,5 +30,5 @@ def set_name_strip_kind(config, tasks, primary_dep, primary_kind):
 
 
 @set_name("retain-kind")
-def set_name_retain_kind(config, tasks, primary_dep, primary_kind):
+def set_name_retain_kind(config, tasks, primary_dep, primary_kind, name):
     return primary_dep.label

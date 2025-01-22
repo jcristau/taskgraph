@@ -209,7 +209,7 @@ def from_deps(config, tasks):
 
             if set_name:
                 func = SET_NAME_MAP[set_name]
-                new_task["name"] = func(config, deps, primary_dep, primary_kind)
+                new_task["name"] = func(config, deps, primary_dep, primary_kind, new_task["name"])
 
             if copy_attributes:
                 attrs = new_task.setdefault("attributes", {})
