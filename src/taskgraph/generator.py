@@ -66,6 +66,7 @@ class Kind:
             config,
             parameters,
             list(kind_dependencies_tasks.values()),
+            write_artifacts,
         )
 
         transforms = TransformSequence()

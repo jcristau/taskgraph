@@ -243,7 +243,7 @@ def test_default_loader(config, expected_transforms):
     assert loader is default_loader, (
         "Default Kind loader should be taskgraph.loader.default.loader"
     )
-    loader("", "", config, {}, [])
+    loader("", "", config, {}, [], False)
 
     assert config["transforms"] == expected_transforms
 
@@ -273,7 +273,7 @@ def test_default_loader(config, expected_transforms):
 def test_default_loader_errors(config):
     loader = Kind("", "", config, {})._get_loader()
     try:
-        loader("", "", config, {}, [])
+        loader("", "", config, {}, [], False)
     except KeyError:
         return
 
