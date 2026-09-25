@@ -54,7 +54,7 @@ DEFAULT_SLICE_COUNT = 1
 # discover the size costs more than the parallelism saves.
 DEFAULT_SLICE_MIN_BYTES = 64 * 1024 * 1024
 
-CHUNK_SIZE = 65536
+CHUNK_SIZE = 1024 * 1024
 
 # How much the request that probes for range support downloads. Large enough
 # that the round trip isn't wasted on small files -- most are fetched outright
@@ -497,7 +497,7 @@ def stream_download(url, sha256=None, size=None, headers=None):
                     size = content_length
 
         while True:
-            chunk = fh.read(65536)
+            chunk = fh.read(CHUNK_SIZE)
             if not chunk:
                 break
 
