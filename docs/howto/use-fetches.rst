@@ -112,18 +112,30 @@ Tuning Download Performance
 ``fetch-content`` already downloads the artifacts of a task concurrently, but
 each one is fetched over a single connection, which can leave a fast worker's
 network idle when a task depends on one or two large artifacts. The following
-environment variables tune this. Both are off by default, because whether
-either helps depends on where a worker sits relative to the artifact storage;
-measure with the ``fetch_content`` Perfherder suite before turning them on for
-a worker pool.
+environment variables tune this. Slicing is off by default, because whether it
+helps depends on where a worker sits relative to the artifact storage; measure
+with the ``fetch_content`` Perfherder suite before turning it on for a worker
+pool.
 
 ``TASKGRAPH_FETCH_SLICES``
-   Number of concurrent HTTP range requests to split a single download into.
-   Defaults to ``1``, which disables slicing. Servers that don't support range
-   requests fall back to a single stream automatically.
+   Set to ``2`` or more to split large downloads into pieces fetched over
+   concurrent HTTP range requests. ``1``, the default, disables slicing. The
+   pieces of every download share one pool of connections, and pieces of
+   larger files go first, so that the largest artifact finishes first. A
+   piece that fails, or that is much slower than the others, is re-requested
+   from where it stopped. Servers that don't support range requests fall back
+   to a single stream automatically.
 
 ``TASKGRAPH_FETCH_SLICE_MIN_BYTES``
-   Downloads smaller than this are never sliced. Defaults to 64MB.
+   Downloads smaller than this are never sliced. Defaults to 64MiB. Each
+   download starts with a plain request, so downloads under this size cost no
+   extra round trip.
+
+``TASKGRAPH_FETCH_PIECE_BYTES``
+   Size of the pieces sliced downloads are split into. Defaults to 32MiB.
+
+``TASKGRAPH_FETCH_CONNECTIONS``
+   Number of connections sliced downloads share. Defaults to 8.
 
 ``TASKGRAPH_SKIP_CDN``
    Set to ``1`` to send the ``x-taskcluster-skip-cdn`` header when fetching

@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import http.server
 import io
@@ -10,6 +11,7 @@ import stat
 import sys
 import tarfile
 import threading
+import urllib.error
 import urllib.request
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
@@ -39,16 +41,27 @@ def fetch_content_mod():
 
 
 class RangeServer(http.server.ThreadingHTTPServer):
-    """Serves a single blob, optionally honouring range requests."""
+    """Serves a single blob, optionally honouring range requests.
+
+    ``faults`` maps a Range header value to a list of faults to inject, one
+    per request for that range: "error" answers 500, "truncate" sends half of
+    the body and closes the connection, and "slow" pauses half way through.
+    """
 
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, content, ranges=True):
+    def __init__(
+        self, content, ranges=True, accept_ranges="bytes", gzip=False, log=None
+    ):
         super().__init__(("127.0.0.1", 0), RangeHandler)
         self.content = content
         self.ranges = ranges
+        self.accept_ranges = accept_ranges
+        self.gzip = gzip
+        self.faults = {}
         self.requests = []
+        self.log = log
         self.lock = threading.Lock()
 
     @property
@@ -67,6 +80,16 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
         requested = self.headers.get("Range")
         with self.server.lock:
             self.server.requests.append(requested)
+            if self.server.log is not None:
+                self.server.log.append((self.server, requested))
+            faults = self.server.faults.get(requested)
+            fault = faults.pop(0) if faults else None
+
+        if fault == "error":
+            self.send_response(500)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
 
         start, end = 0, len(content) - 1
         partial = False
@@ -74,7 +97,6 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
             start, _, last = requested.partition("=")[2].partition("-")
             start, end = int(start), int(last)
             if start >= len(content):
-                # An empty object makes every range unsatisfiable.
                 self.send_response(416)
                 self.send_header("Content-Range", f"bytes */{len(content)}")
                 self.send_header("Content-Length", "0")
@@ -87,8 +109,23 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(206 if partial else 200)
         if partial:
             self.send_header("Content-Range", f"bytes {start}-{end}/{len(content)}")
+        elif self.server.gzip and "gzip" in self.headers.get("Accept-Encoding", ""):
+            body = gzip.compress(body)
+            self.send_header("Content-Encoding", "gzip")
+        if self.server.accept_ranges:
+            self.send_header("Accept-Ranges", self.server.accept_ranges)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        if fault == "truncate":
+            self.wfile.write(body[: len(body) // 2])
+            self.close_connection = True
+            return
+        if fault == "slow":
+            self.wfile.write(body[: len(body) // 2])
+            self.wfile.flush()
+            threading.Event().wait(1)
+            self.wfile.write(body[len(body) // 2 :])
+            return
         self.wfile.write(body)
 
 
@@ -96,8 +133,8 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
 def serve():
     servers = []
 
-    def inner(content, ranges=True):
-        server = RangeServer(content, ranges=ranges)
+    def inner(content, **kwargs):
+        server = RangeServer(content, **kwargs)
         threading.Thread(
             target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
         ).start()
@@ -113,15 +150,16 @@ def serve():
 
 @pytest.fixture
 def sliced(monkeypatch, fetch_content_mod):
-    """Enable slicing with boundaries small enough to exercise in a test."""
+    """Enable slicing with sizes small enough to exercise in a test."""
 
-    def inner(slices=4, min_bytes=1024, probe=256):
-        monkeypatch.setenv("TASKGRAPH_FETCH_SLICES", str(slices))
+    def inner(min_bytes=1024, piece_bytes=1000, connections=4):
+        monkeypatch.setenv("TASKGRAPH_FETCH_SLICES", "8")
         monkeypatch.setenv("TASKGRAPH_FETCH_SLICE_MIN_BYTES", str(min_bytes))
-        monkeypatch.setattr(fetch_content_mod, "PROBE_BYTES", probe)
-        # remaining_slices refuses to make slices smaller than a megabyte,
-        # which would collapse every test case down to a single slice.
-        monkeypatch.setattr(fetch_content_mod, "MIN_SLICE_BYTES", 64)
+        monkeypatch.setenv("TASKGRAPH_FETCH_PIECE_BYTES", str(piece_bytes))
+        monkeypatch.setenv("TASKGRAPH_FETCH_CONNECTIONS", str(connections))
+        monkeypatch.setattr(fetch_content_mod, "_connection_pool", None)
+        monkeypatch.setattr(fetch_content_mod.time, "sleep", lambda s: None)
+        return fetch_content_mod.get_connection_pool()
 
     return inner
 
@@ -129,93 +167,295 @@ def sliced(monkeypatch, fetch_content_mod):
 def test_sliced_download(tmp_path, fetch_content_mod, serve, sliced):
     content = os.urandom(4096)
     server = serve(content)
-    sliced(slices=4)
+    sliced(piece_bytes=1000)
     dest = tmp_path / "blob"
 
-    assert fetch_content_mod.sliced_download_to_path(
+    fetch_content_mod.sliced_download_to_path(
         server.url,
         dest,
         sha256=hashlib.sha256(content).hexdigest(),
         size=len(content),
     )
     assert dest.read_bytes() == content
-    # The probe, plus one request per remaining slice.
-    assert len(server.requests) == 5
-    assert server.requests[0] == "bytes=0-255"
+    assert not dest.with_name("blob.tmp").exists()
+    # A plain GET that carries on with the first piece, then one range request
+    # for each of the others.
+    assert server.requests[0] is None
+    assert sorted(server.requests[1:]) == [
+        "bytes=1000-1999",
+        "bytes=2000-2999",
+        "bytes=3000-3999",
+        "bytes=4000-4095",
+    ]
 
 
 def test_sliced_download_reassembles_out_of_order(
     tmp_path, fetch_content_mod, serve, sliced
 ):
-    """Slices land at the right offsets no matter what order they finish in."""
+    """Pieces land at the right offsets no matter what order they finish in."""
     content = bytes(i % 251 for i in range(100000))
     server = serve(content)
-    sliced(slices=8)
+    sliced(piece_bytes=999, connections=8)
     dest = tmp_path / "blob"
 
-    assert fetch_content_mod.sliced_download_to_path(server.url, dest)
+    fetch_content_mod.sliced_download_to_path(server.url, dest)
     assert dest.read_bytes() == content
+    assert len(server.requests) == 101
 
 
-def test_sliced_download_disabled(tmp_path, fetch_content_mod, serve, monkeypatch):
-    server = serve(b"x" * 4096)
-    monkeypatch.setenv("TASKGRAPH_FETCH_SLICES", "1")
+def test_sliced_download_exact_multiple(tmp_path, fetch_content_mod, serve, sliced):
+    content = os.urandom(4000)
+    server = serve(content)
+    sliced(piece_bytes=1000)
     dest = tmp_path / "blob"
 
-    assert not fetch_content_mod.sliced_download_to_path(server.url, dest)
-    assert server.requests == []
-    assert not dest.exists()
+    fetch_content_mod.sliced_download_to_path(server.url, dest, size=len(content))
+    assert dest.read_bytes() == content
+    assert sorted(server.requests[1:]) == [
+        "bytes=1000-1999",
+        "bytes=2000-2999",
+        "bytes=3000-3999",
+    ]
 
 
-def test_sliced_download_known_small_size_skips_probe(
+def test_sliced_download_first_piece_covers_everything(
     tmp_path, fetch_content_mod, serve, sliced
 ):
-    content = b"x" * 512
+    content = os.urandom(2000)
     server = serve(content)
-    sliced(slices=4, min_bytes=1024)
+    sliced(min_bytes=1024, piece_bytes=4096)
     dest = tmp_path / "blob"
 
-    assert not fetch_content_mod.sliced_download_to_path(
-        server.url, dest, size=len(content)
+    fetch_content_mod.sliced_download_to_path(
+        server.url, dest, sha256=hashlib.sha256(content).hexdigest()
     )
-    assert server.requests == []
+    assert dest.read_bytes() == content
+    assert server.requests == [None]
 
 
-def test_sliced_download_unknown_small_size_finishes_in_probe(
-    tmp_path, fetch_content_mod, serve, sliced
+@pytest.mark.parametrize("size", (None, 512), ids=("unknown size", "known size"))
+def test_sliced_download_small_file_single_request(
+    tmp_path, fetch_content_mod, serve, sliced, size
 ):
-    """A file the probe swallows whole costs exactly one request."""
-    content = b"x" * 200
+    """Files under the threshold cost exactly one request, with no Range."""
+    content = os.urandom(512)
     server = serve(content)
-    sliced(slices=4, min_bytes=1024, probe=256)
+    sliced(min_bytes=1024)
     dest = tmp_path / "blob"
 
-    assert fetch_content_mod.sliced_download_to_path(server.url, dest)
+    fetch_content_mod.sliced_download_to_path(
+        server.url, dest, sha256=hashlib.sha256(content).hexdigest(), size=size
+    )
     assert dest.read_bytes() == content
-    assert len(server.requests) == 1
+    assert server.requests == [None]
+
+
+def test_sliced_download_at_threshold(tmp_path, fetch_content_mod, serve, sliced):
+    content = os.urandom(1024)
+    server = serve(content)
+    sliced(min_bytes=1024, piece_bytes=512)
+    dest = tmp_path / "blob"
+
+    fetch_content_mod.sliced_download_to_path(server.url, dest)
+    assert dest.read_bytes() == content
+    assert server.requests == [None, "bytes=512-1023"]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    (
+        pytest.param(None, False, id="unset"),
+        pytest.param("", False, id="empty"),
+        pytest.param("0", False, id="0"),
+        pytest.param("1", False, id="1"),
+        pytest.param("2", True, id="2"),
+        pytest.param("8", True, id="8"),
+        pytest.param("lots", False, id="garbage"),
+    ),
+)
+def test_slicing_enabled(fetch_content_mod, monkeypatch, value, expected):
+    monkeypatch.delenv("TASKGRAPH_FETCH_SLICES", raising=False)
+    if value is not None:
+        monkeypatch.setenv("TASKGRAPH_FETCH_SLICES", value)
+    assert fetch_content_mod.slicing_enabled() is expected
+
+
+def test_download_to_path_slicing_disabled(
+    tmp_path, fetch_content_mod, serve, sliced, monkeypatch
+):
+    content = os.urandom(4096)
+    server = serve(content)
+    sliced()
+    monkeypatch.setenv("TASKGRAPH_FETCH_SLICES", "1")
+    monkeypatch.setattr(
+        fetch_content_mod,
+        "get_connection_pool",
+        lambda: pytest.fail("the connection pool must not be used"),
+    )
+    dest = tmp_path / "blob"
+
+    fetch_content_mod.download_to_path(server.url, dest)
+    assert dest.read_bytes() == content
+    assert server.requests == [None]
+
+
+def test_download_to_path_sliced(tmp_path, fetch_content_mod, serve, sliced):
+    content = os.urandom(4096)
+    server = serve(content)
+    sliced(piece_bytes=1000)
+    dest = tmp_path / "blob"
+
+    fetch_content_mod.download_to_path(
+        server.url, dest, sha256=hashlib.sha256(content).hexdigest()
+    )
+    assert dest.read_bytes() == content
+    assert len(server.requests) == 5
 
 
 def test_sliced_download_no_range_support(tmp_path, fetch_content_mod, serve, sliced):
-    server = serve(b"x" * 4096, ranges=False)
+    """A server that ignores Range headers is detected on the first piece."""
+    server = serve(os.urandom(4096), ranges=False, accept_ranges=None)
     sliced()
     dest = tmp_path / "blob"
 
-    assert not fetch_content_mod.sliced_download_to_path(server.url, dest)
+    with pytest.raises(fetch_content_mod.RangeNotSupported):
+        fetch_content_mod.sliced_download_to_path(server.url, dest)
     assert not dest.exists()
+    assert not dest.with_name("blob.tmp").exists()
+
+
+def test_download_to_path_no_range_support_falls_back(
+    tmp_path, fetch_content_mod, serve, sliced
+):
+    content = os.urandom(4096)
+    server = serve(content, ranges=False, accept_ranges=None)
+    sliced()
+    dest = tmp_path / "blob"
+
+    fetch_content_mod.download_to_path(
+        server.url, dest, sha256=hashlib.sha256(content).hexdigest()
+    )
+    assert dest.read_bytes() == content
+    # The single stream fallback is the last request.
+    assert server.requests[-1] is None
+
+
+def test_sliced_download_accept_ranges_none(tmp_path, fetch_content_mod, serve, sliced):
+    content = os.urandom(4096)
+    server = serve(content, accept_ranges="none")
+    sliced()
+    dest = tmp_path / "blob"
+
+    fetch_content_mod.sliced_download_to_path(server.url, dest)
+    assert dest.read_bytes() == content
+    assert server.requests == [None]
+
+
+def test_sliced_download_gzip_encoded(tmp_path, fetch_content_mod, serve, sliced):
+    """Byte ranges of a gzip encoded response can't be spliced together."""
+    content = b"compressible " * 1000
+    server = serve(content, gzip=True)
+    sliced(min_bytes=16)
+    dest = tmp_path / "blob"
+
+    fetch_content_mod.sliced_download_to_path(
+        server.url, dest, sha256=hashlib.sha256(content).hexdigest()
+    )
+    assert dest.read_bytes() == content
+    assert server.requests == [None]
 
 
 def test_sliced_download_empty_object(tmp_path, fetch_content_mod, serve, sliced):
-    """A zero length artifact 416s, and must fall back rather than blow up."""
     server = serve(b"")
     sliced()
     dest = tmp_path / "blob"
 
-    assert not fetch_content_mod.sliced_download_to_path(server.url, dest)
-    assert not dest.exists()
-
-    # ...and the fallback still downloads it.
-    fetch_content_mod.download_to_path(server.url, dest)
+    fetch_content_mod.sliced_download_to_path(server.url, dest)
     assert dest.read_bytes() == b""
+    assert server.requests == [None]
+
+
+@pytest.mark.parametrize("fault", ("error", "truncate"))
+def test_sliced_download_piece_retry(tmp_path, fetch_content_mod, serve, sliced, fault):
+    content = os.urandom(4096)
+    server = serve(content)
+    server.faults["bytes=1000-1999"] = [fault]
+    sliced(piece_bytes=1000)
+    dest = tmp_path / "blob"
+
+    fetch_content_mod.sliced_download_to_path(
+        server.url, dest, sha256=hashlib.sha256(content).hexdigest()
+    )
+    assert dest.read_bytes() == content
+    # A truncated piece resumes from where it stopped.
+    retry = "bytes=1000-1999" if fault == "error" else "bytes=1500-1999"
+    assert retry in server.requests[server.requests.index("bytes=1000-1999") + 1 :]
+
+
+def test_sliced_download_first_piece_retry(tmp_path, fetch_content_mod, serve, sliced):
+    """The first piece is re-requested with a range if the GET breaks off."""
+    content = os.urandom(4000)
+    server = serve(content)
+    server.faults[None] = ["truncate"]
+    sliced(piece_bytes=1000)
+    dest = tmp_path / "blob"
+
+    fetch_content_mod.sliced_download_to_path(server.url, dest)
+    assert dest.read_bytes() == content
+    # Half of the 4000 bytes body went out before the connection closed, so
+    # the first piece was complete.
+    assert "bytes=0-999" not in server.requests
+
+    server.requests.clear()
+    server.faults[None] = ["error"]
+    with pytest.raises(urllib.error.HTTPError):
+        fetch_content_mod.sliced_download_to_path(server.url, dest)
+
+
+def test_sliced_download_first_piece_resumes(
+    tmp_path, fetch_content_mod, serve, sliced
+):
+    content = os.urandom(4000)
+    server = serve(content)
+    server.faults[None] = ["truncate"]
+    sliced(piece_bytes=3000)
+    dest = tmp_path / "blob"
+
+    fetch_content_mod.sliced_download_to_path(server.url, dest)
+    assert dest.read_bytes() == content
+    assert "bytes=2000-2999" in server.requests
+
+
+def test_sliced_download_piece_fails(tmp_path, fetch_content_mod, serve, sliced):
+    server = serve(os.urandom(4096))
+    server.faults["bytes=2000-2999"] = ["error"] * 3
+    sliced(piece_bytes=1000)
+    dest = tmp_path / "blob"
+
+    with pytest.raises(urllib.error.HTTPError):
+        fetch_content_mod.sliced_download_to_path(server.url, dest)
+    assert server.requests.count("bytes=2000-2999") == 3
+    assert not dest.exists()
+    assert not dest.with_name("blob.tmp").exists()
+
+
+def test_sliced_download_straggler(
+    tmp_path, fetch_content_mod, serve, sliced, monkeypatch
+):
+    """A piece that is much slower than the others is re-requested."""
+    content = os.urandom(4000)
+    server = serve(content)
+    server.faults["bytes=1000-1999"] = ["slow"]
+    pool = sliced(piece_bytes=1000, connections=1)
+    monkeypatch.setattr(fetch_content_mod, "CHUNK_SIZE", 100)
+    monkeypatch.setattr(fetch_content_mod, "STRAGGLER_MIN_SECONDS", 0.2)
+    for _ in range(4):
+        pool.record(1000, 0.001)
+    dest = tmp_path / "blob"
+
+    fetch_content_mod.sliced_download_to_path(server.url, dest)
+    assert dest.read_bytes() == content
+    assert "bytes=1600-1999" in server.requests
 
 
 def test_sliced_download_bad_sha256(tmp_path, fetch_content_mod, serve, sliced):
@@ -223,27 +463,39 @@ def test_sliced_download_bad_sha256(tmp_path, fetch_content_mod, serve, sliced):
     sliced()
     dest = tmp_path / "blob"
 
-    with pytest.raises(fetch_content_mod.IntegrityError):
+    with pytest.raises(fetch_content_mod.IntegrityError, match="sha256 mismatch"):
         fetch_content_mod.sliced_download_to_path(server.url, dest, sha256="0" * 64)
 
     assert not dest.exists()
     assert not dest.with_name(f"{dest.name}.tmp").exists()
 
 
-def test_sliced_download_bad_size(tmp_path, fetch_content_mod, serve, sliced):
-    server = serve(os.urandom(4096))
+@pytest.mark.parametrize("length", (4096, 512), ids=("sliced", "single"))
+def test_sliced_download_bad_size(tmp_path, fetch_content_mod, serve, sliced, length):
+    server = serve(os.urandom(length))
     sliced()
     dest = tmp_path / "blob"
 
-    with pytest.raises(fetch_content_mod.IntegrityError):
+    with pytest.raises(fetch_content_mod.IntegrityError, match="size mismatch"):
         fetch_content_mod.sliced_download_to_path(server.url, dest, size=9999)
 
+    assert server.requests == [None]
     assert not dest.exists()
     assert not dest.with_name(f"{dest.name}.tmp").exists()
 
 
+def test_sliced_download_bad_sha256_single(tmp_path, fetch_content_mod, serve, sliced):
+    server = serve(os.urandom(512))
+    sliced()
+    dest = tmp_path / "blob"
+
+    with pytest.raises(fetch_content_mod.IntegrityError, match="sha256 mismatch"):
+        fetch_content_mod.sliced_download_to_path(server.url, dest, sha256="0" * 64)
+    assert not dest.with_name(f"{dest.name}.tmp").exists()
+
+
 def test_sliced_download_forwards_headers(tmp_path, fetch_content_mod, serve, sliced):
-    """Caller supplied headers reach every request, not just the probe."""
+    """Caller supplied headers reach every request, not just the first."""
     seen = []
 
     class Recording(RangeHandler):
@@ -253,45 +505,81 @@ def test_sliced_download_forwards_headers(tmp_path, fetch_content_mod, serve, sl
 
     server = serve(os.urandom(4096))
     server.RequestHandlerClass = Recording
-    sliced(slices=4)
+    sliced(piece_bytes=1000)
 
-    assert fetch_content_mod.sliced_download_to_path(
+    fetch_content_mod.sliced_download_to_path(
         server.url, tmp_path / "blob", headers=["x-taskcluster-skip-cdn: true"]
     )
     assert seen == ["true"] * 5
 
 
+def test_connection_pool_priority(fetch_content_mod):
+    pool = fetch_content_mod.ConnectionPool(1)
+    gate = threading.Event()
+    done = threading.Event()
+    order = []
+    pool.submit(0, gate.wait)
+    for priority, name in ((5, "a"), (1, "b"), (5, "c"), (float("-inf"), "d")):
+        pool.submit(priority, order.append, name)
+    pool.submit(10, done.set)
+    gate.set()
+    assert done.wait(5)
+    assert order == ["d", "b", "a", "c"]
+
+
+def test_sliced_download_largest_first(tmp_path, fetch_content_mod, serve, sliced):
+    """Pieces of the larger file are all fetched before those of the smaller."""
+    log = []
+    small = serve(os.urandom(3000), log=log)
+    large = serve(os.urandom(8000), log=log)
+    pool = sliced(piece_bytes=1000, connections=1)
+
+    # Hold the only connection until both downloads are queued.
+    gate = threading.Event()
+    pool.submit(float("-inf"), gate.wait)
+    threads = [
+        threading.Thread(
+            target=fetch_content_mod.sliced_download_to_path,
+            args=(server.url, tmp_path / name),
+        )
+        for server, name in ((small, "small"), (large, "large"))
+    ]
+    for thread in threads:
+        thread.start()
+    while len(pool._queue) < 2:
+        threading.Event().wait(0.01)
+    gate.set()
+    for thread in threads:
+        thread.join(10)
+
+    assert (tmp_path / "small").read_bytes() == small.content
+    assert (tmp_path / "large").read_bytes() == large.content
+    # Both GETs go first, as they are how sizes are discovered.
+    assert [server for server, _ in log[:2]] == [small, large]
+    assert [server for server, _ in log[2:]] == [large] * 7 + [small] * 2
+
+
 @pytest.mark.parametrize(
-    "start,total,slices,expected",
+    "start,total,piece_bytes,expected",
     (
         pytest.param(
-            0, 400, 4, [(0, 99), (100, 199), (200, 299), (300, 399)], id="even"
+            0, 400, 100, [(0, 99), (100, 199), (200, 299), (300, 399)], id="exact"
         ),
-        pytest.param(
-            0, 10, 4, [(0, 1), (2, 3), (4, 5), (6, 9)], id="remainder to last"
-        ),
-        pytest.param(64, 128, 2, [(64, 95), (96, 127)], id="offset start"),
-        pytest.param(100, 100, 4, [], id="nothing left"),
-        pytest.param(200, 100, 4, [], id="past the end"),
-        pytest.param(0, 100, 1, [(0, 99)], id="single"),
+        pytest.param(0, 250, 100, [(0, 99), (100, 199), (200, 249)], id="remainder"),
+        pytest.param(0, 50, 100, [(0, 49)], id="smaller than a piece"),
+        pytest.param(64, 128, 32, [(64, 95), (96, 127)], id="offset start"),
+        pytest.param(100, 100, 32, [], id="nothing left"),
+        pytest.param(200, 100, 32, [], id="past the end"),
     ),
 )
-def test_remaining_slices(
-    fetch_content_mod, monkeypatch, start, total, slices, expected
-):
-    monkeypatch.setattr(fetch_content_mod, "MIN_SLICE_BYTES", 1)
-    assert fetch_content_mod.remaining_slices(start, total, slices) == expected
+def test_split_pieces(fetch_content_mod, start, total, piece_bytes, expected):
+    assert fetch_content_mod.split_pieces(start, total, piece_bytes) == expected
     if expected:
         # The ranges must tile the region exactly, with no gaps or overlaps.
         assert expected[0][0] == start
         assert expected[-1][1] == total - 1
         for (_, prev_end), (next_start, _) in zip(expected, expected[1:]):
             assert next_start == prev_end + 1
-
-
-def test_remaining_slices_respects_minimum(fetch_content_mod):
-    """Slices below the minimum are merged rather than each taking a connection."""
-    assert fetch_content_mod.remaining_slices(0, 1024, 8) == [(0, 1023)]
 
 
 @pytest.mark.parametrize(

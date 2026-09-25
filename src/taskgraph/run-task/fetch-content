@@ -5,12 +5,16 @@
 
 import argparse
 import bz2
+import collections
 import concurrent.futures
 import contextlib
 import datetime
+import functools
 import gzip
 import hashlib
+import heapq
 import io
+import itertools
 import json
 import lzma
 import multiprocessing
@@ -44,28 +48,34 @@ except ImportError:
 
 CONCURRENCY = multiprocessing.cpu_count()
 
-# Number of concurrent HTTP range requests to split a single download into.
-# 1 disables slicing entirely, which is the default: whether slicing helps
-# depends on how much bandwidth a single connection can get on a given worker,
-# so it is opt-in via TASKGRAPH_FETCH_SLICES until measured.
-DEFAULT_SLICE_COUNT = 1
+# Whether to split large downloads into pieces fetched over concurrent HTTP
+# range requests. Off by default: whether it helps depends on how much
+# bandwidth a single connection gets on a given worker, so it is opt-in via
+# TASKGRAPH_FETCH_SLICES until measured.
+DEFAULT_SLICING = False
 
-# Downloads smaller than this are never sliced. The extra round trip needed to
-# discover the size costs more than the parallelism saves.
+# Downloads smaller than this are never sliced.
 DEFAULT_SLICE_MIN_BYTES = 64 * 1024 * 1024
+
+# Size of the pieces a sliced download is split into. A slow connection only
+# holds up one piece, which can then be re-requested.
+DEFAULT_PIECE_BYTES = 32 * 1024 * 1024
+
+# Number of connections sliced downloads share. Past about 8, Python's read
+# loops compete for the GIL rather than for bandwidth.
+DEFAULT_CONNECTIONS = 8
 
 CHUNK_SIZE = 1024 * 1024
 
-# How much the request that probes for range support downloads. Large enough
-# that the round trip isn't wasted on small files -- most are fetched outright
-# -- and small enough not to delay the concurrent slices by much.
-PROBE_BYTES = 1024 * 1024
+# A piece that has taken STRAGGLER_FACTOR times longer than recent pieces
+# suggest, and at least STRAGGLER_MIN_SECONDS, is re-requested from where it got
+# to, up to MAX_STRAGGLER_RETRIES times.
+STRAGGLER_FACTOR = 4
+STRAGGLER_MIN_SECONDS = 1
+MAX_STRAGGLER_RETRIES = 2
 
-# Slices below this size don't earn a connection of their own.
-MIN_SLICE_BYTES = 1024 * 1024
-
-_slice_pool = None
-_slice_pool_lock = threading.Lock()
+_connection_pool = None
+_connection_pool_lock = threading.Lock()
 
 
 def log(msg):
@@ -220,25 +230,88 @@ def urlopen(req, timeout=60):
     return urllib.request.urlopen(req, timeout=timeout, **kwargs)
 
 
-def get_slice_pool():
-    """Thread pool shared by all sliced downloads.
+class RangeNotSupported(Exception):
+    """The server didn't honour a range request the way we expected."""
 
-    ``fetch_urls`` already runs one thread per download, and each of those may
-    ask for several slices. Funnelling the slices through a single pool keeps
-    the number of in-flight connections bounded by CONCURRENCY rather than
-    multiplying the two together.
+
+class Straggler(Exception):
+    """A piece is downloading much slower than it should."""
+
+
+class ConnectionPool:
+    """Runs HTTP requests on a fixed number of threads, in priority order.
+
+    Requests with the lowest priority value run first, and requests with the
+    same priority run in the order they were submitted.
     """
-    global _slice_pool
-    with _slice_pool_lock:
-        if _slice_pool is None:
-            _slice_pool = concurrent.futures.ThreadPoolExecutor(
-                CONCURRENCY, thread_name_prefix="fetch-slice"
+
+    def __init__(self, size):
+        self._queue = []
+        self._counter = itertools.count()
+        self._cond = threading.Condition()
+        self._rates = collections.deque(maxlen=32)
+        for i in range(size):
+            threading.Thread(
+                target=self._run, name=f"fetch-connection-{i}", daemon=True
+            ).start()
+
+    def submit(self, priority, fn, *args):
+        with self._cond:
+            heapq.heappush(self._queue, (priority, next(self._counter), fn, args))
+            self._cond.notify()
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while not self._queue:
+                    self._cond.wait()
+                _, _, fn, args = heapq.heappop(self._queue)
+            try:
+                fn(*args)
+            except Exception as e:
+                log(f"Unexpected error in connection pool: {e}")
+
+    def record(self, nbytes, seconds):
+        with self._cond:
+            self._rates.append(nbytes / max(seconds, 1e-6))
+
+    def is_straggler(self, nbytes, started):
+        """Whether a request for ``nbytes`` is much slower than recent ones."""
+        elapsed = time.monotonic() - started
+        if elapsed < STRAGGLER_MIN_SECONDS:
+            return False
+        with self._cond:
+            rates = sorted(self._rates)
+        if len(rates) < 4:
+            return False
+        return elapsed > STRAGGLER_FACTOR * nbytes / rates[len(rates) // 2]
+
+
+def get_connection_pool():
+    """Connection pool shared by all sliced downloads."""
+    global _connection_pool
+    with _connection_pool_lock:
+        if _connection_pool is None:
+            _connection_pool = ConnectionPool(
+                max(1, env_int("TASKGRAPH_FETCH_CONNECTIONS", DEFAULT_CONNECTIONS))
             )
-        return _slice_pool
+        return _connection_pool
+
+
+def slicing_enabled():
+    if not os.environ.get("TASKGRAPH_FETCH_SLICES", "").strip():
+        return DEFAULT_SLICING
+    return env_int("TASKGRAPH_FETCH_SLICES", 1) > 1
+
+
+def request_headers(headers):
+    parsed = {"Accept-Encoding": "gzip"}
+    parsed.update(parse_headers(headers))
+    return parsed
 
 
 def range_headers(headers, start, end):
-    parsed = dict(headers)
+    parsed = parse_headers(headers)
     # Ranges and transfer encodings don't mix: we want byte offsets into the
     # stored object, not into a gzip stream.
     parsed["Accept-Encoding"] = "identity"
@@ -246,71 +319,38 @@ def range_headers(headers, start, end):
     return parsed
 
 
-def write_slice(src, path, start, end):
-    """Copy ``src`` into ``path`` at ``start``, checking it stops at ``end``."""
-    expected = end - start + 1
-    written = 0
-    with path.open("r+b") as dst:
-        dst.seek(start)
-        while True:
-            chunk = src.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            written += len(chunk)
-            if written > expected:
-                raise IntegrityError(
-                    f"bytes={start}-{end} returned more than the {expected} "
-                    "bytes requested"
-                )
-            dst.write(chunk)
-
-    if written != expected:
-        raise IntegrityError(
-            f"bytes={start}-{end}: wanted {expected} bytes; got {written}"
+def check_range_response(response, url, start, end, total):
+    if response.getcode() != 206:
+        raise RangeNotSupported(
+            f"{url} returned {response.getcode()} to a range request"
+        )
+    content_range = (response.getheader("content-range") or "").strip()
+    if content_range != f"bytes {start}-{end}/{total}":
+        raise RangeNotSupported(
+            f"{url} returned Content-Range: {content_range} when asked for "
+            f"bytes {start}-{end}/{total}"
         )
 
 
-def download_first_slice(url, path, length, headers):
-    """Download the first ``length`` bytes of ``url`` to the start of ``path``.
+def copy_range(src, dst, end, too_slow=None):
+    """Copy ``src`` into ``dst``, from its current position through ``end``."""
+    offset = dst.tell()
+    while offset <= end:
+        chunk = src.read(min(CHUNK_SIZE, end + 1 - offset))
+        if not chunk:
+            raise IntegrityError(f"response ended at offset {offset}, before {end}")
+        dst.write(chunk)
+        offset += len(chunk)
+        if too_slow and offset <= end and too_slow():
+            raise Straggler(f"too slow, reached offset {offset} of {end}")
 
-    Doubles as a probe for range support. Returns a ``(url, end, size)`` tuple,
-    where the URL is the one the request finally resolved to -- so the
-    remaining slices don't each have to redo the redirects -- ``end`` is the
-    last offset written, and ``size`` is the total length of the content. They
-    are all ``None``, and nothing is written, if the server didn't honour the
-    range request.
-    """
-    req = urllib.request.Request(url, None, range_headers(headers, 0, length - 1))
-    try:
-        with urlopen(req) as src:
-            if src.getcode() != 206:
-                return None, None, None
 
-            match = re.match(
-                r"^bytes 0-(\d+)/(\d+)$",
-                (src.getheader("content-range") or "").strip(),
-            )
-            if not match:
-                return None, None, None
-
-            end, total = int(match.group(1)), int(match.group(2))
-            final_url = src.geturl()
-
-            # The file doesn't exist yet and its final size wasn't known until
-            # now, so create it before writing into it. It gets extended to the
-            # full size once the caller knows there is more to come.
-            with path.open("wb"):
-                pass
-            write_slice(src, path, 0, end)
-    except urllib.error.HTTPError as e:
-        # A zero length object makes any range unsatisfiable, so an empty
-        # artifact lands here rather than returning a 206 covering the whole
-        # (empty) object. Any other error will resurface on the single stream
-        # fallback, where it gets reported the same way it always has been.
-        log(f"Range request for {url} returned {e.code}; not slicing")
-        return None, None, None
-
-    return final_url, end, total
+def split_pieces(start, total, piece_bytes):
+    """Split ``start``..``total`` into inclusive ranges of ``piece_bytes``."""
+    return [
+        (offset, min(offset + piece_bytes, total) - 1)
+        for offset in range(start, total, piece_bytes)
+    ]
 
 
 def sha256_path(path):
@@ -324,126 +364,196 @@ def sha256_path(path):
     return h.hexdigest()
 
 
-def download_slice(url, path, start, end, headers, attempts=3):
-    """Download ``bytes=start-end`` of ``url`` into ``path`` at that offset."""
-    for attempt in range(attempts):
-        try:
-            req = urllib.request.Request(url, None, range_headers(headers, start, end))
-            with urlopen(req) as src:
-                if src.getcode() != 206:
-                    raise IntegrityError(
-                        f"expected a 206 response for bytes={start}-{end} of "
-                        f"{url}; got {src.getcode()}"
-                    )
-                write_slice(src, path, start, end)
-            return
-        except Exception as e:
-            log(f"Slice bytes={start}-{end} of {url} failed: {e}")
-            if attempt == attempts - 1:
-                raise
-            time.sleep(2**attempt)
+class SlicedDownload:
+    """A download over the shared connection pool, in pieces if it is large.
 
+    The first request is a plain GET, so that a download too small to slice
+    costs a single request. If the response shows a large file, the rest of
+    it is queued as range requests for fixed size pieces, prioritized by the
+    size of the file so that the largest finishes first, and the GET carries
+    on with the first piece.
+    """
 
-def remaining_slices(start, total, slices):
-    """Split ``start``..``total`` into ``slices`` inclusive ranges."""
-    remaining = total - start
-    if remaining <= 0:
-        return []
-
-    slices = max(1, min(slices, remaining // MIN_SLICE_BYTES))
-    length = remaining // slices
-    return [
-        (
-            start + i * length,
-            total - 1 if i == slices - 1 else start + (i + 1) * length - 1,
+    def __init__(self, pool, url, path, sha256=None, size=None, headers=None):
+        self.pool = pool
+        self.url = url
+        self.path = path
+        self.sha256 = sha256
+        self.size = size
+        self.headers = headers
+        self.min_bytes = env_int(
+            "TASKGRAPH_FETCH_SLICE_MIN_BYTES", DEFAULT_SLICE_MIN_BYTES
         )
-        for i in range(slices)
-    ]
+        self.piece_bytes = max(
+            1, env_int("TASKGRAPH_FETCH_PIECE_BYTES", DEFAULT_PIECE_BYTES)
+        )
+        self.total = None
+        self.error = None
+        self._pending = 1
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+
+    def run(self):
+        """Download to ``self.path``, removing it if anything fails."""
+        t0 = time.time()
+        self.pool.submit(float("-inf"), self._start)
+        self._done.wait()
+        try:
+            if self.error is not None:
+                raise self.error
+            if self.total is not None:
+                if self.sha256:
+                    digest = sha256_path(self.path)
+                    if digest != self.sha256:
+                        raise IntegrityError(
+                            f"sha256 mismatch on {self.url}: wanted {self.sha256}; "
+                            f"got {digest}"
+                        )
+                    log(f"Verified sha256 integrity of {self.url}")
+                log(
+                    f"{self.url} resolved to {self.total} bytes in "
+                    f"{time.time() - t0:.3f}s"
+                )
+        except Exception:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+    def _sliceable_length(self, response):
+        if response.getcode() != 200:
+            return None
+        encoding = (response.getheader("content-encoding") or "identity").strip()
+        if encoding.lower() != "identity":
+            return None
+        if (response.getheader("accept-ranges") or "").strip().lower() == "none":
+            return None
+        try:
+            length = int(response.getheader("content-length"))
+        except (TypeError, ValueError):
+            return None
+        return length if length >= self.min_bytes else None
+
+    def _start(self):
+        try:
+            t0 = time.time()
+            req = urllib.request.Request(self.url, None, request_headers(self.headers))
+            with urlopen(req) as src:
+                total = self._sliceable_length(src)
+                if total is None:
+                    with self.path.open("wb") as fh:
+                        for chunk in stream_response(
+                            self.url, src, self.sha256, self.size, t0
+                        ):
+                            fh.write(chunk)
+                    return
+
+                if self.size is not None and self.size != total:
+                    raise IntegrityError(
+                        f"size mismatch on {self.url}: wanted {self.size}; "
+                        f"content-length is {total}"
+                    )
+                with self.path.open("wb") as fh:
+                    fh.truncate(total)
+                self.total = total
+
+                # Later requests go straight to where the redirects led.
+                url = src.geturl()
+                first_end = min(self.piece_bytes, total) - 1
+                pieces = split_pieces(first_end + 1, total, self.piece_bytes)
+                log(
+                    f"Downloading {self.url} ({total} bytes) in {len(pieces) + 1} pieces"
+                )
+                with self._lock:
+                    self._pending += len(pieces)
+                for start, end in pieces:
+                    self.pool.submit(-total, self._piece, url, start, end)
+                self._fetch(url, 0, first_end, response=src)
+        except Exception as e:
+            self._fail(e)
+        finally:
+            self._finish_one()
+
+    def _piece(self, url, start, end):
+        try:
+            if self.error is None:
+                self._fetch(url, start, end)
+        except Exception as e:
+            self._fail(e)
+        finally:
+            self._finish_one()
+
+    def _fetch(self, url, start, end, response=None, attempts=3):
+        """Download bytes ``start``-``end`` of ``url`` into place.
+
+        A request that fails, or turns out much slower than it should, is
+        retried from where it got to. ``response`` is an already open response
+        positioned at ``start`` to use for the first attempt.
+        """
+        failures = stragglers = 0
+        with self.path.open("r+b") as dst:
+            dst.seek(start)
+            while True:
+                offset = dst.tell()
+                t0 = time.monotonic()
+                too_slow = None
+                if stragglers < MAX_STRAGGLER_RETRIES:
+                    too_slow = functools.partial(
+                        self.pool.is_straggler, end + 1 - offset, t0
+                    )
+                ranged = response is None
+                try:
+                    if ranged:
+                        req = urllib.request.Request(
+                            url, None, range_headers(self.headers, offset, end)
+                        )
+                        response = urlopen(req)
+                    with response:
+                        if ranged:
+                            check_range_response(response, url, offset, end, self.total)
+                        copy_range(response, dst, end, too_slow)
+                    if ranged:
+                        self.pool.record(end + 1 - offset, time.monotonic() - t0)
+                    return
+                except RangeNotSupported:
+                    raise
+                except Straggler as e:
+                    stragglers += 1
+                    log(f"bytes={offset}-{end} of {url} {e}; re-requesting the rest")
+                except Exception as e:
+                    failures += 1
+                    log(f"bytes={offset}-{end} of {url} failed: {e}")
+                    if failures == attempts:
+                        raise
+                    time.sleep(2 ** (failures - 1))
+                finally:
+                    response = None
+
+    def _fail(self, error):
+        with self._lock:
+            if self.error is None:
+                self.error = error
+
+    def _finish_one(self):
+        with self._lock:
+            self._pending -= 1
+            if self._pending == 0:
+                self._done.set()
 
 
 def sliced_download_to_path(url, path, sha256=None, size=None, headers=None):
-    """Download ``url`` to ``path`` using concurrent HTTP range requests.
+    """Download ``url`` to ``path`` over the shared connection pool.
 
-    Returns True if the download happened, and False if slicing is disabled or
-    the server doesn't support range requests, in which case the caller should
-    fall back to a single stream. Raises if the download itself fails.
+    Large downloads are split into pieces fetched concurrently. Raises
+    ``RangeNotSupported`` if the server turns out not to honour range
+    requests, in which case the caller should fall back to a single stream.
     """
-    slices = env_int("TASKGRAPH_FETCH_SLICES", DEFAULT_SLICE_COUNT)
-    min_bytes = env_int("TASKGRAPH_FETCH_SLICE_MIN_BYTES", DEFAULT_SLICE_MIN_BYTES)
-    if slices < 2:
-        return False
-
-    # When the size is known up front, small downloads can be ruled out without
-    # issuing any requests at all.
-    if size is not None and size < min_bytes:
-        return False
-
-    parsed_headers = parse_headers(headers)
     tmp = path.with_name(f"{path.name}.tmp")
-    t0 = time.time()
-
-    try:
-        final_url, probe_end, total = download_first_slice(
-            url, tmp, PROBE_BYTES, parsed_headers
-        )
-        if total is None:
-            log(f"Cannot slice {url}; downloading it in a single stream")
-            return False
-
-        if size is not None and size != total:
-            raise IntegrityError(
-                f"size mismatch on {url}: wanted {size}; range request reports {total}"
-            )
-
-        with tmp.open("r+b") as fh:
-            fh.truncate(total)
-
-        # The size wasn't known until the probe came back. Now that the first
-        # chunk is on disk there is no point falling back, so finish
-        # under-sized downloads with a single request for the remainder.
-        ranges = remaining_slices(
-            probe_end + 1, total, slices if total >= min_bytes else 1
-        )
-        if ranges:
-            log(f"Downloading {url} ({total} bytes) in {len(ranges) + 1} slices")
-            pool = get_slice_pool()
-            futures = [
-                pool.submit(download_slice, final_url, tmp, start, end, parsed_headers)
-                for start, end in ranges
-            ]
-
-            error = None
-            for future in futures:
-                try:
-                    future.result()
-                except Exception as e:
-                    if error is None:
-                        error = e
-                        # Don't start slices that haven't been picked up yet,
-                        # but keep waiting on the rest so that nothing is still
-                        # writing to the file when we remove it.
-                        for pending in futures:
-                            pending.cancel()
-            if error is not None:
-                raise error
-
-        if sha256:
-            digest = sha256_path(tmp)
-            if digest != sha256:
-                raise IntegrityError(
-                    f"sha256 mismatch on {url}: wanted {sha256}; got {digest}"
-                )
-            log(f"Verified sha256 integrity of {url}")
-    except Exception:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-
-    log(f"{url} resolved to {total} bytes in {time.time() - t0:.3f}s")
+    SlicedDownload(
+        get_connection_pool(), url, tmp, sha256=sha256, size=size, headers=headers
+    ).run()
     tmp.rename(path)
-    return True
 
 
 def stream_download(url, sha256=None, size=None, headers=None):
@@ -460,51 +570,52 @@ def stream_download(url, sha256=None, size=None, headers=None):
     on after the generator is exhausted without raising.
     """
     log(f"Downloading {url}")
-    headers = headers or []
+    t0 = time.time()
+    req = urllib.request.Request(url, None, request_headers(headers))
+    with urlopen(req) as fh:
+        yield from stream_response(url, fh, sha256=sha256, size=size, t0=t0)
 
+
+def stream_response(url, fh, sha256=None, size=None, t0=None):
+    """Like ``stream_download``, for an already open response."""
     h = hashlib.sha256()
     length = 0
+    t0 = t0 or time.time()
 
-    t0 = time.time()
-    req_headers = {"Accept-Encoding": "gzip"}
-    req_headers.update(parse_headers(headers))
-
-    req = urllib.request.Request(url, None, req_headers)
-    with urlopen(req) as fh:
-        if not url.endswith(".gz") and fh.info().get("Content-Encoding") == "gzip":
-            fh = gzip.GzipFile(fileobj=fh)
-        else:
-            # when using gzip we can't compare size or length (inflated) against content-length (compressed)
-            content_length = fh.getheader("content-length")
-            if content_length:
-                try:
-                    content_length = int(content_length)
-                except ValueError:
+    if not url.endswith(".gz") and fh.info().get("Content-Encoding") == "gzip":
+        fh = gzip.GzipFile(fileobj=fh)
+    else:
+        # when using gzip we can't compare size or length (inflated) against content-length (compressed)
+        content_length = fh.getheader("content-length")
+        if content_length:
+            try:
+                content_length = int(content_length)
+            except ValueError:
+                raise IntegrityError(
+                    f"content-length header for {url} is not an integer; got {content_length}"
+                )
+            if size:
+                if size != content_length:
                     raise IntegrityError(
-                        f"content-length header for {url} is not an integer; got {content_length}"
-                    )
-                if size:
-                    if size != content_length:
-                        raise IntegrityError(
-                            "size mismatch on {}: wanted {}; content-length is {}, x-cache-status is: {}".format(
-                                url,
-                                size,
-                                content_length,
-                                fh.getheader("x-cache-status"),
-                            )
+                        "size mismatch on {}: wanted {}; content-length is {}, x-cache-status is: {}".format(
+                            url,
+                            size,
+                            content_length,
+                            fh.getheader("x-cache-status"),
                         )
-                else:
-                    size = content_length
+                    )
+            else:
+                size = content_length
 
-        while True:
-            chunk = fh.read(CHUNK_SIZE)
-            if not chunk:
-                break
+    while True:
+        chunk = fh.read(CHUNK_SIZE)
+        if not chunk:
+            break
 
-            h.update(chunk)
-            length += len(chunk)
+        h.update(chunk)
+        length += len(chunk)
 
-            yield chunk
+        yield chunk
 
     duration = time.time() - t0
     digest = h.hexdigest()
@@ -541,10 +652,14 @@ def download_to_path(url, path, sha256=None, size=None, headers=None):
         try:
             log(f"Downloading {url} to {path}")
 
-            if sliced_download_to_path(
-                url, path, sha256=sha256, size=size, headers=headers
-            ):
-                return
+            if slicing_enabled():
+                try:
+                    sliced_download_to_path(
+                        url, path, sha256=sha256, size=size, headers=headers
+                    )
+                    return
+                except RangeNotSupported as e:
+                    log(f"{e}; downloading {url} in a single stream")
 
             with rename_after_close(path, "wb") as fh:
                 for chunk in stream_download(
