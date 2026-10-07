@@ -1,5 +1,11 @@
 # Change Log
 
+## [Unreleased]
+
+### Changed
+
+- perf: on Linux, load each kind in a process forked once the kinds it depends on are loaded, instead of in a process pool, so the tasks of the kinds it depends on don't need to be pickled and sent to it
+
 ## [24.4.0] - 2026-10-05
 
 ### Added
